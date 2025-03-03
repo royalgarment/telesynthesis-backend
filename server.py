@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
@@ -26,8 +26,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
 # Buffers and state
-audio_buffer = deque()
-header_chunk = None
+audio_buffers = {}
+conversation_history = {}
+header_chunks = {}
 TEMP_WEBM_FILE = "temp_audio.webm"
 TEMP_WAV_FILE = "temp_audio.wav"
 CHUNKS_TO_PROCESS = 20
@@ -37,7 +38,7 @@ MAX_FAILED_PROCESSES = 5
 
 # Database Models
 class Policy(db.Model):
-    __tablename__ = 'policies'  # Explicit table name
+    __tablename__ = 'policies'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), nullable=False)
     category = db.Column(db.String(100))
@@ -47,59 +48,65 @@ class Policy(db.Model):
     requires_disclaimer = db.Column(db.Boolean, default=False)
 
 class Disclaimer(db.Model):
-    __tablename__ = 'disclaimers'  # Explicit table name
+    __tablename__ = 'disclaimers'
     id = db.Column(db.Integer, primary_key=True)
     policy_id = db.Column(db.Integer, db.ForeignKey('policies.id'))
     text = db.Column(db.Text, nullable=False)
 
-@socketio.on("audio_chunk")
-def handle_audio_chunk(data):
-    global header_chunk
-    print(f"Received audio chunk of size {len(data)} bytes")
-    if header_chunk is None:
-        header_chunk = data
-    audio_buffer.append(data)
-    print(f"Buffer size: {len(audio_buffer)} chunks")
-    if len(audio_buffer) >= CHUNKS_TO_PROCESS:
-        process_audio_buffer()
-
 @socketio.on("connect")
 def handle_connect():
-    print("Client connected")
-    global header_chunk, FAILED_PROCESS_COUNT
-    header_chunk = None
+    session_id = request.sid
+    print(f"Client connected with session ID: {session_id}")
+    audio_buffers[session_id] = deque()
+    conversation_history[session_id] = []
+    header_chunks[session_id] = None
+    global FAILED_PROCESS_COUNT
     FAILED_PROCESS_COUNT = 0
     with open(TEMP_WEBM_FILE, "wb") as f:
         f.write(b"")
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    print("Client disconnected")
-    global audio_buffer, header_chunk, FAILED_PROCESS_COUNT
-    audio_buffer.clear()
-    header_chunk = None
-    FAILED_PROCESS_COUNT = 0
+    session_id = request.sid
+    print(f"Client {session_id} disconnected")
+    if session_id in audio_buffers:
+        del audio_buffers[session_id]
+    if session_id in conversation_history:
+        del conversation_history[session_id]
+    if session_id in header_chunks:
+        del header_chunks[session_id]
     for temp_file in [TEMP_WEBM_FILE, TEMP_WAV_FILE, DEBUG_WEBM_FILE]:
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
-def process_audio_buffer():
-    global audio_buffer, header_chunk, FAILED_PROCESS_COUNT
-    if not audio_buffer or header_chunk is None:
-        print("Buffer empty or no header, skipping processing")
+@socketio.on("audio_chunk")
+def handle_audio_chunk(data):
+    session_id = request.sid
+    print(f"Received audio chunk from {session_id} of size {len(data)} bytes")
+    if header_chunks[session_id] is None:
+        header_chunks[session_id] = data
+    audio_buffers[session_id].append(data)
+    print(f"Buffer size for {session_id}: {len(audio_buffers[session_id])} chunks")
+    if len(audio_buffers[session_id]) >= CHUNKS_TO_PROCESS:
+        process_audio_buffer(session_id)
+
+def process_audio_buffer(session_id):
+    global FAILED_PROCESS_COUNT
+    if session_id not in audio_buffers or not audio_buffers[session_id] or header_chunks[session_id] is None:
+        print(f"Buffer empty or no header for {session_id}, skipping processing")
         return
 
-    print(f"Processing {len(audio_buffer)} chunks...")
+    print(f"Processing {len(audio_buffers[session_id])} chunks for {session_id}...")
     with open(TEMP_WEBM_FILE, "wb") as f:
-        print(f"Writing header chunk of size {len(header_chunk)} bytes")
-        f.write(header_chunk)
-        subsequent_chunks = list(audio_buffer)[1:]
+        print(f"Writing header chunk of size {len(header_chunks[session_id])} bytes for {session_id}")
+        f.write(header_chunks[session_id])
+        subsequent_chunks = list(audio_buffers[session_id])[1:]
         total_subsequent_size = sum(len(chunk) for chunk in subsequent_chunks)
         print(f"Writing {len(subsequent_chunks)} subsequent chunks, total size: {total_subsequent_size} bytes")
         f.write(b"".join(subsequent_chunks))
     with open(DEBUG_WEBM_FILE, "wb") as f:
-        f.write(header_chunk)
-        f.write(b"".join(list(audio_buffer)[1:]))
+        f.write(header_chunks[session_id])
+        f.write(b"".join(list(audio_buffers[session_id])[1:]))
 
     try:
         print("Running FFmpeg conversion...")
@@ -117,8 +124,8 @@ def process_audio_buffer():
         audio_segment = AudioSegment.from_wav(TEMP_WAV_FILE)
         print(f"Audio duration: {len(audio_segment) / 1000:.1f}s")
 
-        transcribe_and_analyze(audio_segment)
-        audio_buffer.clear()
+        transcribe_and_analyze(audio_segment, session_id)
+        audio_buffers[session_id].clear()
         FAILED_PROCESS_COUNT = 0
 
     except subprocess.CalledProcessError as e:
@@ -126,87 +133,97 @@ def process_audio_buffer():
         FAILED_PROCESS_COUNT += 1
         print(f"Failed process count: {FAILED_PROCESS_COUNT}")
         if FAILED_PROCESS_COUNT >= MAX_FAILED_PROCESSES:
-            print("Too many FFmpeg failures, resetting header_chunk")
-            header_chunk = None
-        audio_buffer.clear()
+            print(f"Too many FFmpeg failures for {session_id}, resetting header_chunk")
+            header_chunks[session_id] = None
+        audio_buffers[session_id].clear()
     except Exception as e:
-        print(f"Processing error: {str(e)}")
-        audio_buffer.clear()
+        print(f"Processing error for {session_id}: {str(e)}")
+        audio_buffers[session_id].clear()
 
-def transcribe_and_analyze(audio_segment):
+def transcribe_and_analyze(audio_segment, session_id):
     try:
-        print("Exporting audio to buffer...")
+        print(f"Exporting audio to buffer for {session_id}...")
         wav_buffer = io.BytesIO()
         audio_segment.export(wav_buffer, format="wav")
         wav_buffer.name = "audio.wav"
         wav_buffer.seek(0)
 
-        print("Sending to Whisper API...")
+        print(f"Sending to Whisper API for {session_id}...")
         transcript = openai.audio.transcriptions.create(
             model="whisper-1",
             file=wav_buffer,
             language="en"
         ).text
 
-        print(f"Transcription: {transcript} (Type: {type(transcript)})")
-        socketio.emit("transcript_update", {"transcript": transcript})
+        print(f"Transcription for {session_id}: {transcript} (Type: {type(transcript)})")
+        socketio.emit("transcript_update", {"transcript": transcript}, room=session_id)
 
-        policy = detect_policy_intent(transcript)
-        print(f"Detected Policy: {policy.name if policy else 'None'}")
-        policy_data = {
-            "id": policy.id,
-            "name": policy.name,
-            "color_code": policy.color_code,
-            "requires_disclaimer": policy.requires_disclaimer
-        } if policy else None
-        socketio.emit("policy_update", {"policy": policy_data})
+        # Store in conversation history
+        conversation_history[session_id].append({"role": "user", "content": transcript})
 
-        ai_response = analyze_with_ai(transcript, policy)
-        socketio.emit("ai_response", ai_response)
+        # Check for disclaimer agreement
+        policy = None
+        clarification_question = None
+        if any("disclaimer" in msg["content"].lower() and ("yes" in msg["content"].lower() or "agree" in msg["content"].lower()) 
+               for msg in conversation_history[session_id][-3:]):  # Check last 3 messages
+            print(f"Disclaimer agreement detected for {session_id}")
+            last_policy = next((msg.get("policy") for msg in reversed(conversation_history[session_id]) if "policy" in msg), None)
+            if last_policy:
+                policy = Policy.query.filter_by(name=last_policy).first()
+                conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} agreed"})
+        
+        if not policy:  # Only detect policy if no agreement yet
+            policy, clarification_question = detect_policy_intent(transcript, session_id)
+            if clarification_question:
+                print(f"Emitting clarification question for {session_id}: {clarification_question}")
+                socketio.emit("clarification_needed", {"question": clarification_question}, room=session_id)
+                return
+
+        if policy:
+            print(f"Detected Policy for {session_id}: {policy.name}")
+            policy_data = {
+                "id": policy.id,
+                "name": policy.name,
+                "color_code": policy.color_code,
+                "requires_disclaimer": policy.requires_disclaimer
+            }
+            socketio.emit("policy_update", {"policy": policy_data}, room=session_id)
+            conversation_history[session_id].append({"role": "system", "content": f"Policy {policy.name} selected", "policy": policy.name})
+
+            ai_response = analyze_with_ai(transcript, policy, session_id)
+            socketio.emit("ai_response", ai_response, room=session_id)
+        else:
+            print(f"No policy detected for {session_id}")
+            socketio.emit("policy_update", {"policy": None}, room=session_id)
 
     except Exception as e:
-        print(f"Transcription/Analysis error: {str(e)}")
+        print(f"Transcription/Analysis error for {session_id}: {str(e)}")
         raise
 
-def detect_policy_intent(transcript):
-    print(f"Checking policies for transcript: '{transcript}'")
+def detect_policy_intent(transcript, session_id):
+    print(f"Detecting policy intent for {session_id} with transcript: '{transcript}'")
     policies = Policy.query.all()
     print(f"Found {len(policies)} policies in database")
-    for policy in policies:
-        keywords = policy.keywords.split(",")
-        print(f"Policy: {policy.name}, Keywords: {keywords}")
-        if any(keyword.strip().lower() in transcript.lower() for keyword in keywords):
-            print(f"Matched policy: {policy.name}")
-            return policy
-    print("No policy matched")
-    return None
+    
+    policy_options = "\n".join(
+        [f"Policy: {p.name}, Keywords: {p.keywords}, Summary: {p.text[:100]}..." for p in policies]
+    )
 
-def analyze_with_ai(transcript, policy=None):
+    system_message = (
+        "You are an AI that selects the most relevant policy based on conversation context. "
+        "Given the conversation history and policy options, determine the best matching policy. "
+        "If the intent is clear, return the policy name. If ambiguous or unclear (e.g., multiple policies could apply "
+        "or context is insufficient), return 'None' and suggest a clarifying question for the telemarketer to ask. "
+        "Respond with a JSON object: {\"policy_name\": \"[policy name or None]\", \"clarification\": \"[question or null]\"}"
+    )
+
+    prompt = (
+        f"Conversation History:\n{json.dumps(conversation_history[session_id], indent=2)}\n\n"
+        f"Policy Options:\n{policy_options}\n\n"
+        "Analyze the user's intent and respond with a JSON object as described."
+    )
+
     try:
-        system_message = (
-            "You are an AI assistant ensuring policy compliance. "
-            "Your response must strictly use the provided policy text from the database as the basis for your answer. "
-            "Do not rely on general knowledge outside the policy text unless explicitly stated. "
-            "Return a JSON object with 'policy_name' (exact name of the policy or 'general' if none), "
-            "'response' (answer based solely on the policy text), and 'disclaimer' (from the policy if applicable, otherwise null)."
-        )
-        policy_text = policy.text if policy else "No specific policy applies."
-        disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy and policy.requires_disclaimer else None
-        
-        print(f"Policy Text Type: {type(policy_text)}, Value: {policy_text}")
-        print(f"Disclaimer Type: {type(disclaimer)}, Value: {disclaimer}")
-        prompt = (
-            f"Policy Text: {str(policy_text)}\n"
-            f"User Input: {str(transcript)}\n"
-            "Using ONLY the Policy Text above (do not add external information), provide a JSON response with the following structure:\n"
-            "{\n"
-            "  \"policy_name\": \"[exact policy name or 'general']\",\n"
-            "  \"response\": \"[direct quote or paraphrase from policy text]\",\n"
-            "  \"disclaimer\": \"[disclaimer text or null]\"\n"
-            "}"
-        )
-
-        print(f"Sending prompt to GPT-4: {prompt}")
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -217,33 +234,95 @@ def analyze_with_ai(transcript, policy=None):
         )
 
         ai_output = response.choices[0].message.content.strip()
-        print(f"Raw AI Output: {ai_output}")
+        print(f"GPT-4 Intent Output for {session_id}: {ai_output}")
+        result = json.loads(ai_output)
+        policy_name = result["policy_name"]
+        clarification = result.get("clarification", None)
+
+        if clarification:
+            return None, clarification
+        return next((p for p in policies if p.name == policy_name), None) if policy_name != "None" else None, None
+    
+    except Exception as e:
+        print(f"Intent detection error for {session_id}: {str(e)}")
+        return None, None
+
+def analyze_with_ai(transcript, policy=None, session_id=None):
+    try:
+        system_message = (
+            "You are an AI assistant ensuring policy compliance. "
+            "Your response must strictly use the provided policy text from the database as the basis for your answer. "
+            "Do not rely on general knowledge outside the policy text unless explicitly stated. "
+            "Return a JSON object with 'policy_name' (exact name of the policy or 'general' if none), "
+            "'response' (answer based solely on the policy text), 'disclaimer' (from the policy if applicable), "
+            "and 'disclaimer_agreed' (true if the user has agreed to the disclaimer in the conversation history, false otherwise)."
+        )
+        policy_text = policy.text if policy else "No specific policy applies."
+        disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy and policy.requires_disclaimer else None
+        disclaimer_agreed = any(f"Disclaimer for {policy.name} agreed" in msg["content"] 
+                                for msg in conversation_history[session_id]) if policy and disclaimer else False
+        
+        print(f"Policy Text Type for {session_id}: {type(policy_text)}, Value: {policy_text}")
+        print(f"Disclaimer Type for {session_id}: {type(disclaimer)}, Value: {disclaimer}")
+        print(f"Disclaimer Agreed for {session_id}: {disclaimer_agreed}")
+        
+        history_summary = json.dumps(conversation_history[session_id], indent=2)
+        prompt = (
+            f"Conversation History:\n{history_summary}\n\n"
+            f"Policy Text: {str(policy_text)}\n"
+            f"User Input: {str(transcript)}\n"
+            "Using ONLY the Policy Text above (do not add external information), provide a JSON response with the following structure:\n"
+            "{\n"
+            "  \"policy_name\": \"[exact policy name or 'general']\",\n"
+            "  \"response\": \"[direct quote or paraphrase from policy text]\",\n"
+            "  \"disclaimer\": \"[disclaimer text or null]\",\n"
+            "  \"disclaimer_agreed\": [true or false]\n"
+            "}"
+        )
+
+        print(f"Sending prompt to GPT-4 for {session_id}: {prompt}")
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2
+        )
+
+        ai_output = response.choices[0].message.content.strip()
+        print(f"Raw AI Output for {session_id}: {ai_output}")
         try:
             json_response = json.loads(ai_output)
+            # Ensure disclaimer_agreed is set correctly based on conversation history
+            json_response["disclaimer_agreed"] = disclaimer_agreed
         except json.JSONDecodeError:
-            print("GPT-4 did not return valid JSON, using fallback")
+            print(f"GPT-4 did not return valid JSON for {session_id}, using fallback")
             json_response = {
                 "policy_name": policy.name if policy else "general",
                 "response": f"Based on the policy: {policy_text}",
-                "disclaimer": disclaimer
+                "disclaimer": disclaimer,
+                "disclaimer_agreed": disclaimer_agreed
             }
 
-        print(f"Parsed AI Response: {json_response}")
+        print(f"Parsed AI Response for {session_id}: {json_response}")
         return json_response
 
     except Exception as e:
-        print(f"AI Analysis error: {str(e)}")
+        print(f"AI Analysis error for {session_id}: {str(e)}")
         return {
             "policy_name": "error",
             "response": f"Error analyzing: {str(e)}",
-            "disclaimer": None
+            "disclaimer": None,
+            "disclaimer_agreed": False
         }
 
 def background_task():
     while True:
         eventlet.sleep(1)
-        if len(audio_buffer) >= CHUNKS_TO_PROCESS:
-            process_audio_buffer()
+        for session_id in audio_buffers:
+            if len(audio_buffers[session_id]) >= CHUNKS_TO_PROCESS:
+                process_audio_buffer(session_id)
 
 eventlet.spawn(background_task)
 
