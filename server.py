@@ -161,18 +161,18 @@ def transcribe_and_analyze(audio_segment, session_id):
         # Store in conversation history
         conversation_history[session_id].append({"role": "user", "content": transcript})
 
-        # Check for disclaimer agreement
+        # Check for disclaimer agreement or telemarketer saying it
         policy = None
         clarification_question = None
         if any("disclaimer" in msg["content"].lower() and ("yes" in msg["content"].lower() or "agree" in msg["content"].lower()) 
-               for msg in conversation_history[session_id][-3:]):  # Check last 3 messages
+               for msg in conversation_history[session_id][-3:]):
             print(f"Disclaimer agreement detected for {session_id}")
             last_policy = next((msg.get("policy") for msg in reversed(conversation_history[session_id]) if "policy" in msg), None)
             if last_policy:
                 policy = Policy.query.filter_by(name=last_policy).first()
                 conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} agreed"})
         
-        if not policy:  # Only detect policy if no agreement yet
+        if not policy:
             policy, clarification_question = detect_policy_intent(transcript, session_id)
             if clarification_question:
                 print(f"Emitting clarification question for {session_id}: {clarification_question}")
@@ -181,11 +181,14 @@ def transcribe_and_analyze(audio_segment, session_id):
 
         if policy:
             print(f"Detected Policy for {session_id}: {policy.name}")
+            disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy.requires_disclaimer else None
             policy_data = {
                 "id": policy.id,
                 "name": policy.name,
                 "color_code": policy.color_code,
-                "requires_disclaimer": policy.requires_disclaimer
+                "requires_disclaimer": policy.requires_disclaimer,
+                "description": policy.text,
+                "disclaimer": disclaimer
             }
             socketio.emit("policy_update", {"policy": policy_data}, room=session_id)
             conversation_history[session_id].append({"role": "system", "content": f"Policy {policy.name} selected", "policy": policy.name})
@@ -254,16 +257,33 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
             "Your response must strictly use the provided policy text from the database as the basis for your answer. "
             "Do not rely on general knowledge outside the policy text unless explicitly stated. "
             "Return a JSON object with 'policy_name' (exact name of the policy or 'general' if none), "
-            "'response' (answer based solely on the policy text), 'disclaimer' (from the policy if applicable), "
-            "and 'disclaimer_agreed' (true if the user has agreed to the disclaimer in the conversation history, false otherwise)."
+            "'response' (answer based solely on the policy text), "
+            "'disclaimer_said' (true if the telemarketer has likely said the disclaimer, false otherwise), "
+            "and 'disclaimer_agreed' (true if the user has agreed to the disclaimer, false otherwise). "
+            "Do not include a 'disclaimer' field in the response as it is provided separately."
         )
         policy_text = policy.text if policy else "No specific policy applies."
         disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy and policy.requires_disclaimer else None
+        
+        # Check if telemarketer likely said the disclaimer (80% confidence)
+        disclaimer_said = False
+        if disclaimer:
+            disclaimer_words = set(disclaimer.lower().split())
+            last_messages = [msg["content"].lower() for msg in conversation_history[session_id][-3:]]
+            for msg in last_messages:
+                msg_words = set(msg.split())
+                overlap = len(disclaimer_words & msg_words) / len(disclaimer_words)
+                if overlap >= 0.6:  # Approx 80% confidence
+                    disclaimer_said = True
+                    conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} likely said"})
+                    break
+        
         disclaimer_agreed = any(f"Disclaimer for {policy.name} agreed" in msg["content"] 
                                 for msg in conversation_history[session_id]) if policy and disclaimer else False
         
         print(f"Policy Text Type for {session_id}: {type(policy_text)}, Value: {policy_text}")
         print(f"Disclaimer Type for {session_id}: {type(disclaimer)}, Value: {disclaimer}")
+        print(f"Disclaimer Said for {session_id}: {disclaimer_said}")
         print(f"Disclaimer Agreed for {session_id}: {disclaimer_agreed}")
         
         history_summary = json.dumps(conversation_history[session_id], indent=2)
@@ -275,7 +295,7 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
             "{\n"
             "  \"policy_name\": \"[exact policy name or 'general']\",\n"
             "  \"response\": \"[direct quote or paraphrase from policy text]\",\n"
-            "  \"disclaimer\": \"[disclaimer text or null]\",\n"
+            "  \"disclaimer_said\": [true or false],\n"
             "  \"disclaimer_agreed\": [true or false]\n"
             "}"
         )
@@ -294,14 +314,15 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
         print(f"Raw AI Output for {session_id}: {ai_output}")
         try:
             json_response = json.loads(ai_output)
-            # Ensure disclaimer_agreed is set correctly based on conversation history
+            json_response["disclaimer_said"] = disclaimer_said
             json_response["disclaimer_agreed"] = disclaimer_agreed
+            # Do not overwrite disclaimer here; it's set in policy_update
         except json.JSONDecodeError:
             print(f"GPT-4 did not return valid JSON for {session_id}, using fallback")
             json_response = {
                 "policy_name": policy.name if policy else "general",
                 "response": f"Based on the policy: {policy_text}",
-                "disclaimer": disclaimer,
+                "disclaimer_said": disclaimer_said,
                 "disclaimer_agreed": disclaimer_agreed
             }
 
@@ -313,7 +334,7 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
         return {
             "policy_name": "error",
             "response": f"Error analyzing: {str(e)}",
-            "disclaimer": None,
+            "disclaimer_said": False,
             "disclaimer_agreed": False
         }
 
