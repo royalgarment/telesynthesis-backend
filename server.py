@@ -31,7 +31,7 @@ conversation_history = {}
 header_chunks = {}
 TEMP_WEBM_FILE = "temp_audio.webm"
 TEMP_WAV_FILE = "temp_audio.wav"
-CHUNKS_TO_PROCESS = 20
+CHUNKS_TO_PROCESS = 5
 DEBUG_WEBM_FILE = "debug_audio.webm"
 FAILED_PROCESS_COUNT = 0
 MAX_FAILED_PROCESSES = 5
@@ -161,25 +161,22 @@ def transcribe_and_analyze(audio_segment, session_id):
         # Store in conversation history
         conversation_history[session_id].append({"role": "user", "content": transcript})
 
-        # Check for disclaimer agreement or telemarketer saying it
-        policy = None
-        clarification_question = None
-        if any("disclaimer" in msg["content"].lower() and ("yes" in msg["content"].lower() or "agree" in msg["content"].lower()) 
-               for msg in conversation_history[session_id][-3:]):
-            print(f"Disclaimer agreement detected for {session_id}")
-            last_policy = next((msg.get("policy") for msg in reversed(conversation_history[session_id]) if "policy" in msg), None)
-            if last_policy:
-                policy = Policy.query.filter_by(name=last_policy).first()
-                conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} agreed"})
-        
-        if not policy:
-            policy, clarification_question = detect_policy_intent(transcript, session_id)
-            if clarification_question:
+        # Detect policy intent first
+        policy, clarification_question = detect_policy_intent(transcript, session_id)
+
+        # Check for disclaimer agreement only after intent detection
+        if policy:
+            last_policy = next((msg.get("policy") for msg in reversed(conversation_history[session_id][:-1]) if "policy" in msg), None)
+            if any("disclaimer" in msg["content"].lower() and ("yes" in msg["content"].lower() or "agree" in msg["content"].lower()) 
+                   for msg in conversation_history[session_id][-3:]):
+                print(f"Disclaimer agreement detected for {session_id}")
+                if last_policy and last_policy == policy.name:
+                    conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} agreed"})
+            elif clarification_question:
                 print(f"Emitting clarification question for {session_id}: {clarification_question}")
                 socketio.emit("clarification_needed", {"question": clarification_question}, room=session_id)
                 return
 
-        if policy:
             print(f"Detected Policy for {session_id}: {policy.name}")
             disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy.requires_disclaimer else None
             policy_data = {
@@ -197,7 +194,11 @@ def transcribe_and_analyze(audio_segment, session_id):
             socketio.emit("ai_response", ai_response, room=session_id)
         else:
             print(f"No policy detected for {session_id}")
-            socketio.emit("policy_update", {"policy": None}, room=session_id)
+            if clarification_question:
+                print(f"Emitting clarification question for {session_id}: {clarification_question}")
+                socketio.emit("clarification_needed", {"question": clarification_question}, room=session_id)
+            else:
+                socketio.emit("policy_update", {"policy": None}, room=session_id)
 
     except Exception as e:
         print(f"Transcription/Analysis error for {session_id}: {str(e)}")
@@ -214,14 +215,18 @@ def detect_policy_intent(transcript, session_id):
 
     system_message = (
         "You are an AI that selects the most relevant policy based on conversation context. "
-        "Given the conversation history and policy options, determine the best matching policy. "
-        "If the intent is clear, return the policy name. If ambiguous or unclear (e.g., multiple policies could apply "
-        "or context is insufficient), return 'None' and suggest a clarifying question for the telemarketer to ask. "
+        "Focus EXCLUSIVELY on the latest user input to determine the best matching policy, "
+        "unless it is ambiguous or lacks sufficient detail (e.g., 'insurance' alone). "
+        "Only use the conversation history as secondary context if the latest input is unclear. "
+        "Ignore any prior selected policies unless explicitly reaffirmed in the latest input. "
+        "If the intent is clear (e.g., 'car insurance' or 'homeowners insurance'), return the policy name. "
+        "If ambiguous or unclear, return 'None' and suggest a clarifying question. "
         "Respond with a JSON object: {\"policy_name\": \"[policy name or None]\", \"clarification\": \"[question or null]\"}"
     )
 
     prompt = (
-        f"Conversation History:\n{json.dumps(conversation_history[session_id], indent=2)}\n\n"
+        f"Conversation History (use only if latest input is ambiguous):\n{json.dumps(conversation_history[session_id], indent=2)}\n\n"
+        f"Latest User Input (prioritize this):\n{transcript}\n\n"
         f"Policy Options:\n{policy_options}\n\n"
         "Analyze the user's intent and respond with a JSON object as described."
     )
@@ -273,7 +278,7 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
             for msg in last_messages:
                 msg_words = set(msg.split())
                 overlap = len(disclaimer_words & msg_words) / len(disclaimer_words)
-                if overlap >= 0.6:  # Approx 80% confidence
+                if overlap >= 0.6:
                     disclaimer_said = True
                     conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} likely said"})
                     break
@@ -316,7 +321,6 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
             json_response = json.loads(ai_output)
             json_response["disclaimer_said"] = disclaimer_said
             json_response["disclaimer_agreed"] = disclaimer_agreed
-            # Do not overwrite disclaimer here; it's set in policy_update
         except json.JSONDecodeError:
             print(f"GPT-4 did not return valid JSON for {session_id}, using fallback")
             json_response = {
