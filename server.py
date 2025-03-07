@@ -1,42 +1,58 @@
-from flask import Flask, request
+from flask import Flask, Response, request
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
-import openai
-import eventlet
+from google.cloud import speech
+from openai import OpenAI
 import os
-import io
-import time
-import subprocess
+import sounddevice as sd
+import wavio
+import queue
 import json
-from pydub import AudioSegment
-from collections import deque
+import time
+import numpy as np
+import threading
+import logging
+import shutil
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
-
-# Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://policy_user:secure_password@localhost/telesynthesis_db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# OpenAI configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+# Google Speech-to-Text setup
+logger.info("Initializing Google Speech-to-Text client...")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\ryanw\git\telesynthesis-backend\astute-loop-177006-9165f80d7c12.json"
+try:
+    speech_client = speech.SpeechClient()
+    logger.info("Google Speech-to-Text client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Google Speech-to-Text client: {e}")
+    raise
 
-# Buffers and state
-audio_buffers = {}
+logger.info("Initializing OpenAI client...")
+try:
+    openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    logger.info("OpenAI client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI client: {e}")
+    raise
+
 conversation_history = {}
-header_chunks = {}
-TEMP_WEBM_FILE = "temp_audio.webm"
-TEMP_WAV_FILE = "temp_audio.wav"
-CHUNKS_TO_PROCESS = 5
-DEBUG_WEBM_FILE = "debug_audio.webm"
-FAILED_PROCESS_COUNT = 0
-MAX_FAILED_PROCESSES = 5
+event_queues = {}
+AUDIO_FILE_PATH = "temp_audio.wav"
+AUDIO_OUTPUT_DIR = "audio_logs"
+DURATION = 5
+SAMPLE_RATE = 44100
+recording_thread = None
+stop_recording_flag = threading.Event()
 
-# Database Models
+if not os.path.exists(AUDIO_OUTPUT_DIR):
+    os.makedirs(AUDIO_OUTPUT_DIR)
+
 class Policy(db.Model):
     __tablename__ = 'policies'
     id = db.Column(db.Integer, primary_key=True)
@@ -53,131 +69,137 @@ class Disclaimer(db.Model):
     policy_id = db.Column(db.Integer, db.ForeignKey('policies.id'))
     text = db.Column(db.Text, nullable=False)
 
-@socketio.on("connect")
-def handle_connect():
-    session_id = request.sid
-    print(f"Client connected with session ID: {session_id}")
-    audio_buffers[session_id] = deque()
+def event_stream(session_id):
+    q = queue.Queue()
+    event_queues[session_id] = q
+    try:
+        while True:
+            data = q.get()
+            yield f"event: {data['event']}\ndata: {json.dumps(data['data'])}\n\n"
+    except GeneratorExit:
+        logger.info(f"Client {session_id} disconnected from SSE stream")
+        del event_queues[session_id]
+
+@app.route("/events")
+def sse_stream():
+    session_id = request.args.get("session_id", request.remote_addr + str(time.time()))
+    logger.info(f"Client connected to SSE with session ID: {session_id}")
     conversation_history[session_id] = []
-    header_chunks[session_id] = None
-    global FAILED_PROCESS_COUNT
-    FAILED_PROCESS_COUNT = 0
-    with open(TEMP_WEBM_FILE, "wb") as f:
-        f.write(b"")
+    return Response(event_stream(session_id), mimetype="text/event-stream")
 
-@socketio.on("disconnect")
-def handle_disconnect():
-    session_id = request.sid
-    print(f"Client {session_id} disconnected")
-    if session_id in audio_buffers:
-        del audio_buffers[session_id]
-    if session_id in conversation_history:
-        del conversation_history[session_id]
-    if session_id in header_chunks:
-        del header_chunks[session_id]
-    for temp_file in [TEMP_WEBM_FILE, TEMP_WAV_FILE, DEBUG_WEBM_FILE]:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+@app.route("/start_recording", methods=["POST"])
+def start_recording():
+    global recording_thread
+    session_id = request.json.get("session_id")
+    if not session_id or session_id not in event_queues:
+        return {"error": "Invalid or missing session_id"}, 400
+    if recording_thread is None or not recording_thread.is_alive():
+        logger.info(f"Starting recording loop for {session_id}...")
+        stop_recording_flag.clear()
+        recording_thread = threading.Thread(target=record_audio_loop, args=(session_id,))
+        recording_thread.start()
+        event_queues[session_id].put({"event": "recording_started", "data": {"status": "Recording started"}})
+        return {"status": "Recording started"}, 200
+    else:
+        logger.info(f"Recording already in progress for {session_id}")
+        return {"status": "Recording already in progress"}, 200
 
-@socketio.on("audio_chunk")
-def handle_audio_chunk(data):
-    session_id = request.sid
-    print(f"Received audio chunk from {session_id} of size {len(data)} bytes")
-    if header_chunks[session_id] is None:
-        header_chunks[session_id] = data
-    audio_buffers[session_id].append(data)
-    print(f"Buffer size for {session_id}: {len(audio_buffers[session_id])} chunks")
-    if len(audio_buffers[session_id]) >= CHUNKS_TO_PROCESS:
-        process_audio_buffer(session_id)
+@app.route("/stop_recording", methods=["POST"])
+def stop_recording():
+    global recording_thread
+    session_id = request.json.get("session_id")
+    if not session_id or session_id not in event_queues:
+        return {"error": "Invalid or missing session_id"}, 400
+    logger.info(f"Stopping recording for {session_id}...")
+    stop_recording_flag.set()
+    if recording_thread is not None and threading.current_thread() != recording_thread:
+        recording_thread.join(timeout=3)
+        if recording_thread.is_alive():
+            logger.warning(f"Recording thread for {session_id} did not stop cleanly")
+        recording_thread = None
+    event_queues[session_id].put({"event": "recording_stopped", "data": {"status": "Recording stopped"}})
+    return {"status": "Recording stopped"}, 200
 
-def process_audio_buffer(session_id):
-    global FAILED_PROCESS_COUNT
-    if session_id not in audio_buffers or not audio_buffers[session_id] or header_chunks[session_id] is None:
-        print(f"Buffer empty or no header for {session_id}, skipping processing")
-        return
+def trim_silence(audio, threshold=0.02):
+    audio_rms = np.sqrt(np.mean(audio**2))
+    if audio_rms < threshold:
+        return None
+    energy = np.abs(audio)
+    mask = energy > (threshold * np.max(energy))
+    return audio[np.where(mask)[0][0]:np.where(mask)[0][-1] + 1]
 
-    print(f"Processing {len(audio_buffers[session_id])} chunks for {session_id}...")
-    with open(TEMP_WEBM_FILE, "wb") as f:
-        print(f"Writing header chunk of size {len(header_chunks[session_id])} bytes for {session_id}")
-        f.write(header_chunks[session_id])
-        subsequent_chunks = list(audio_buffers[session_id])[1:]
-        total_subsequent_size = sum(len(chunk) for chunk in subsequent_chunks)
-        print(f"Writing {len(subsequent_chunks)} subsequent chunks, total size: {total_subsequent_size} bytes")
-        f.write(b"".join(subsequent_chunks))
-    with open(DEBUG_WEBM_FILE, "wb") as f:
-        f.write(header_chunks[session_id])
-        f.write(b"".join(list(audio_buffers[session_id])[1:]))
+def record_audio_loop(session_id):
+    logger.info(f"🎤 Starting 5s recording loop for {session_id}...")
+    while not stop_recording_flag.is_set():
+        try:
+            if os.path.exists(AUDIO_FILE_PATH):
+                os.remove(AUDIO_FILE_PATH)
+            audio = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
+            sd.wait()
+            audio_rms = np.sqrt(np.mean(audio**2))
+            logger.info(f"🎵 Audio RMS for {session_id}: {audio_rms:.6f}")
+            trimmed_audio = trim_silence(audio)
+            if trimmed_audio is None:
+                logger.info(f"🔇 Silent chunk detected for {session_id}, skipping...")
+                continue
+            wavio.write(AUDIO_FILE_PATH, trimmed_audio, SAMPLE_RATE, sampwidth=2)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            saved_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"audio_{session_id}_{timestamp}.wav")
+            shutil.copy(AUDIO_FILE_PATH, saved_audio_path)
+            logger.info(f"✅ Recorded and saved 5s chunk for {session_id} to {saved_audio_path}")
+            with app.app_context():
+                if session_id in conversation_history:
+                    process_audio(session_id)
+                else:
+                    logger.info(f"Session {session_id} disconnected, stopping recording")
+                    break
+        except Exception as e:
+            logger.error(f"Recording loop error for {session_id}: {str(e)}")
+            event_queues[session_id].put({"event": "error", "data": {"error": str(e)}})
+            break
+    logger.info(f"🛑 Recording loop stopped for {session_id}")
+    if os.path.exists(AUDIO_FILE_PATH):
+        os.remove(AUDIO_FILE_PATH)
 
+def process_audio(session_id):
     try:
-        print("Running FFmpeg conversion...")
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", TEMP_WEBM_FILE, "-f", "wav", TEMP_WAV_FILE],
-            check=True,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE
+        logger.info(f"Transcribing audio for {session_id} with Google Speech-to-Text...")
+        start_time = time.time()
+        with open(AUDIO_FILE_PATH, "rb") as audio_file:
+            content = audio_file.read()
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=SAMPLE_RATE,
+            language_code="en-US",
         )
-        print(f"FFmpeg stdout: {result.stdout.decode()}")
-        if result.stderr:
-            print(f"FFmpeg stderr: {result.stderr.decode()}")
-
-        print("Loading WAV file...")
-        audio_segment = AudioSegment.from_wav(TEMP_WAV_FILE)
-        print(f"Audio duration: {len(audio_segment) / 1000:.1f}s")
-
-        transcribe_and_analyze(audio_segment, session_id)
-        audio_buffers[session_id].clear()
-        FAILED_PROCESS_COUNT = 0
-
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr.decode()}")
-        FAILED_PROCESS_COUNT += 1
-        print(f"Failed process count: {FAILED_PROCESS_COUNT}")
-        if FAILED_PROCESS_COUNT >= MAX_FAILED_PROCESSES:
-            print(f"Too many FFmpeg failures for {session_id}, resetting header_chunk")
-            header_chunks[session_id] = None
-        audio_buffers[session_id].clear()
-    except Exception as e:
-        print(f"Processing error for {session_id}: {str(e)}")
-        audio_buffers[session_id].clear()
-
-def transcribe_and_analyze(audio_segment, session_id):
-    try:
-        print(f"Exporting audio to buffer for {session_id}...")
-        wav_buffer = io.BytesIO()
-        audio_segment.export(wav_buffer, format="wav")
-        wav_buffer.name = "audio.wav"
-        wav_buffer.seek(0)
-
-        print(f"Sending to Whisper API for {session_id}...")
-        transcript = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=wav_buffer,
-            language="en"
-        ).text
-
-        print(f"Transcription for {session_id}: {transcript} (Type: {type(transcript)})")
-        socketio.emit("transcript_update", {"transcript": transcript}, room=session_id)
-
-        # Store in conversation history
+        response = speech_client.recognize(config=config, audio=audio)
+        transcript = " ".join(result.alternatives[0].transcript for result in response.results if result.alternatives).strip()
+        logger.info(f"Transcription for {session_id}: {transcript} (took {time.time() - start_time:.2f}s)")
+        
+        if not transcript or transcript.lower() in ["thank you", "thanks"]:
+            last_transcript = next((msg["content"] for msg in reversed(conversation_history[session_id]) if "content" in msg), "")
+            if transcript.lower() == last_transcript.lower():
+                logger.info(f"Skipping duplicate transcript for {session_id}: {transcript}")
+                return
+        
+        event_queues[session_id].put({"event": "transcript_update", "data": {"transcript": transcript}})
         conversation_history[session_id].append({"role": "user", "content": transcript})
-
-        # Detect policy intent first
         policy, clarification_question = detect_policy_intent(transcript, session_id)
 
-        # Check for disclaimer agreement only after intent detection
         if policy:
             last_policy = next((msg.get("policy") for msg in reversed(conversation_history[session_id][:-1]) if "policy" in msg), None)
             if any("disclaimer" in msg["content"].lower() and ("yes" in msg["content"].lower() or "agree" in msg["content"].lower()) 
                    for msg in conversation_history[session_id][-3:]):
-                print(f"Disclaimer agreement detected for {session_id}")
+                logger.info(f"Disclaimer agreement detected for {session_id}")
                 if last_policy and last_policy == policy.name:
                     conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} agreed"})
             elif clarification_question:
-                print(f"Emitting clarification question for {session_id}: {clarification_question}")
-                socketio.emit("clarification_needed", {"question": clarification_question}, room=session_id)
+                logger.info(f"Emitting clarification question for {session_id}: {clarification_question}")
+                event_queues[session_id].put({"event": "clarification_needed", "data": {"question": clarification_question}})
                 return
 
-            print(f"Detected Policy for {session_id}: {policy.name}")
+            logger.info(f"Detected Policy for {session_id}: {policy.name}")
             disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy.requires_disclaimer else None
             policy_data = {
                 "id": policy.id,
@@ -187,27 +209,27 @@ def transcribe_and_analyze(audio_segment, session_id):
                 "description": policy.text,
                 "disclaimer": disclaimer
             }
-            socketio.emit("policy_update", {"policy": policy_data}, room=session_id)
+            event_queues[session_id].put({"event": "policy_update", "data": {"policy": policy_data}})
             conversation_history[session_id].append({"role": "system", "content": f"Policy {policy.name} selected", "policy": policy.name})
 
             ai_response = analyze_with_ai(transcript, policy, session_id)
-            socketio.emit("ai_response", ai_response, room=session_id)
+            event_queues[session_id].put({"event": "ai_response", "data": ai_response})
         else:
-            print(f"No policy detected for {session_id}")
+            logger.info(f"No policy detected for {session_id}")
             if clarification_question:
-                print(f"Emitting clarification question for {session_id}: {clarification_question}")
-                socketio.emit("clarification_needed", {"question": clarification_question}, room=session_id)
+                logger.info(f"Emitting clarification question for {session_id}: {clarification_question}")
+                event_queues[session_id].put({"event": "clarification_needed", "data": {"question": clarification_question}})
             else:
-                socketio.emit("policy_update", {"policy": None}, room=session_id)
+                event_queues[session_id].put({"event": "policy_update", "data": {"policy": None}})
 
     except Exception as e:
-        print(f"Transcription/Analysis error for {session_id}: {str(e)}")
-        raise
+        logger.error(f"Processing error for {session_id}: {str(e)}")
+        event_queues[session_id].put({"event": "error", "data": {"error": str(e)}})
 
 def detect_policy_intent(transcript, session_id):
-    print(f"Detecting policy intent for {session_id} with transcript: '{transcript}'")
+    logger.info(f"Detecting policy intent for {session_id} with transcript: '{transcript}'")
     policies = Policy.query.all()
-    print(f"Found {len(policies)} policies in database")
+    logger.info(f"Found {len(policies)} policies in database")
     
     policy_options = "\n".join(
         [f"Policy: {p.name}, Keywords: {p.keywords}, Summary: {p.text[:100]}..." for p in policies]
@@ -218,31 +240,33 @@ def detect_policy_intent(transcript, session_id):
         "Focus EXCLUSIVELY on the latest user input to determine the best matching policy, "
         "unless it is ambiguous or lacks sufficient detail (e.g., 'insurance' alone). "
         "Only use the conversation history as secondary context if the latest input is unclear. "
-        "Ignore any prior selected policies unless explicitly reaffirmed in the latest input. "
-        "If the intent is clear (e.g., 'car insurance' or 'homeowners insurance'), return the policy name. "
-        "If ambiguous or unclear, return 'None' and suggest a clarifying question. "
+        "Ignore prior selected policies unless reaffirmed in the latest input. "
+        "Look for keywords like 'loan', 'car', 'vehicle' to match policies like 'Personal Loan Agreement'. "
+        "If intent is clear (e.g., 'I want a loan'), return the policy name. "
+        "If ambiguous, return 'None' and suggest a clarifying question. "
         "Respond with a JSON object: {\"policy_name\": \"[policy name or None]\", \"clarification\": \"[question or null]\"}"
     )
 
-    prompt = (
-        f"Conversation History (use only if latest input is ambiguous):\n{json.dumps(conversation_history[session_id], indent=2)}\n\n"
-        f"Latest User Input (prioritize this):\n{transcript}\n\n"
-        f"Policy Options:\n{policy_options}\n\n"
-        "Analyze the user's intent and respond with a JSON object as described."
-    )
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": (
+            f"Conversation History (use only if latest input is ambiguous):\n{json.dumps(conversation_history[session_id], indent=2)}\n\n"
+            f"Latest User Input (prioritize this):\n{transcript}\n\n"
+            f"Policy Options:\n{policy_options}\n\n"
+            "Analyze the user's intent and respond with a JSON object as described."
+        )}
+    ]
 
     try:
-        response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
-            ],
+        start_time = time.time()
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=100,
             temperature=0.2
         )
-
         ai_output = response.choices[0].message.content.strip()
-        print(f"GPT-4 Intent Output for {session_id}: {ai_output}")
+        logger.info(f"OpenAI Intent Output for {session_id}: {ai_output} (took {time.time() - start_time:.2f}s)")
         result = json.loads(ai_output)
         policy_name = result["policy_name"]
         clarification = result.get("clarification", None)
@@ -252,7 +276,7 @@ def detect_policy_intent(transcript, session_id):
         return next((p for p in policies if p.name == policy_name), None) if policy_name != "None" else None, None
     
     except Exception as e:
-        print(f"Intent detection error for {session_id}: {str(e)}")
+        logger.error(f"Intent detection error for {session_id}: {str(e)}")
         return None, None
 
 def analyze_with_ai(transcript, policy=None, session_id=None):
@@ -263,66 +287,70 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
             "Do not rely on general knowledge outside the policy text unless explicitly stated. "
             "Return a JSON object with 'policy_name' (exact name of the policy or 'general' if none), "
             "'response' (answer based solely on the policy text), "
-            "'disclaimer_said' (true if the telemarketer has likely said the disclaimer, false otherwise), "
-            "and 'disclaimer_agreed' (true if the user has agreed to the disclaimer, false otherwise). "
-            "Do not include a 'disclaimer' field in the response as it is provided separately."
+            "'disclaimer_said' (true if telemarketer likely said the disclaimer, false otherwise), "
+            "'disclaimer_agreed' (true if user agreed to the disclaimer, false otherwise). "
+            "Do not include a 'disclaimer' field in the response."
         )
         policy_text = policy.text if policy else "No specific policy applies."
         disclaimer = Disclaimer.query.filter_by(policy_id=policy.id).first().text if policy and policy.requires_disclaimer else None
         
-        # Check if telemarketer likely said the disclaimer (80% confidence)
         disclaimer_said = False
+        disclaimer_agreed = False
         if disclaimer:
             disclaimer_words = set(disclaimer.lower().split())
+            key_disclaimer_terms = {"credit", "rates", "payments", "fee", "advisor"}
             last_messages = [msg["content"].lower() for msg in conversation_history[session_id][-3:]]
+            logger.info(f"Checking disclaimer '{disclaimer}' against last messages: {last_messages}")
+            
             for msg in last_messages:
                 msg_words = set(msg.split())
                 overlap = len(disclaimer_words & msg_words) / len(disclaimer_words)
-                if overlap >= 0.6:
+                logger.info(f"Overlap for '{msg}': {overlap}")
+                key_terms_matched = len(key_disclaimer_terms & msg_words)
+                logger.info(f"Key terms matched in '{msg}': {key_terms_matched}")
+                
+                if overlap >= 0.3 or key_terms_matched >= 2:
                     disclaimer_said = True
                     conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} likely said"})
                     break
         
-        disclaimer_agreed = any(f"Disclaimer for {policy.name} agreed" in msg["content"] 
-                                for msg in conversation_history[session_id]) if policy and disclaimer else False
-        
-        print(f"Policy Text Type for {session_id}: {type(policy_text)}, Value: {policy_text}")
-        print(f"Disclaimer Type for {session_id}: {type(disclaimer)}, Value: {disclaimer}")
-        print(f"Disclaimer Said for {session_id}: {disclaimer_said}")
-        print(f"Disclaimer Agreed for {session_id}: {disclaimer_agreed}")
-        
-        history_summary = json.dumps(conversation_history[session_id], indent=2)
-        prompt = (
-            f"Conversation History:\n{history_summary}\n\n"
-            f"Policy Text: {str(policy_text)}\n"
-            f"User Input: {str(transcript)}\n"
-            "Using ONLY the Policy Text above (do not add external information), provide a JSON response with the following structure:\n"
-            "{\n"
-            "  \"policy_name\": \"[exact policy name or 'general']\",\n"
-            "  \"response\": \"[direct quote or paraphrase from policy text]\",\n"
-            "  \"disclaimer_said\": [true or false],\n"
-            "  \"disclaimer_agreed\": [true or false]\n"
-            "}"
-        )
+            disclaimer_agreed = any("i agree" in msg or "yes" in msg for msg in last_messages if "disclaimer" in msg)
+            if disclaimer_agreed:
+                conversation_history[session_id].append({"role": "system", "content": f"Disclaimer for {policy.name} agreed"})
+            logger.info(f"Disclaimer said: {disclaimer_said}, agreed: {disclaimer_agreed}")
 
-        print(f"Sending prompt to GPT-4 for {session_id}: {prompt}")
-        response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
-            ],
+        history_summary = json.dumps(conversation_history[session_id], indent=2)
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": (
+                f"Conversation History:\n{history_summary}\n\n"
+                f"Policy Text: {str(policy_text)}\n"
+                f"User Input: {str(transcript)}\n"
+                "Using ONLY the Policy Text above (no external info), provide a JSON response with:\n"
+                "{\n"
+                "  \"policy_name\": \"[exact policy name or 'general']\",\n"
+                "  \"response\": \"[direct quote or paraphrase from policy text]\",\n"
+                "  \"disclaimer_said\": [true or false],\n"
+                "  \"disclaimer_agreed\": [true or false]\n"
+                "}"
+            )}
+        ]
+
+        start_time = time.time()
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=200,
             temperature=0.2
         )
-
         ai_output = response.choices[0].message.content.strip()
-        print(f"Raw AI Output for {session_id}: {ai_output}")
+        logger.info(f"Raw OpenAI Output for {session_id}: {ai_output} (took {time.time() - start_time:.2f}s)")
         try:
             json_response = json.loads(ai_output)
             json_response["disclaimer_said"] = disclaimer_said
             json_response["disclaimer_agreed"] = disclaimer_agreed
         except json.JSONDecodeError:
-            print(f"GPT-4 did not return valid JSON for {session_id}, using fallback")
+            logger.warning(f"OpenAI did not return valid JSON for {session_id}, using fallback")
             json_response = {
                 "policy_name": policy.name if policy else "general",
                 "response": f"Based on the policy: {policy_text}",
@@ -330,11 +358,11 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
                 "disclaimer_agreed": disclaimer_agreed
             }
 
-        print(f"Parsed AI Response for {session_id}: {json_response}")
+        logger.info(f"Parsed AI Response for {session_id}: {json_response}")
         return json_response
 
     except Exception as e:
-        print(f"AI Analysis error for {session_id}: {str(e)}")
+        logger.error(f"AI Analysis error for {session_id}: {str(e)}")
         return {
             "policy_name": "error",
             "response": f"Error analyzing: {str(e)}",
@@ -342,19 +370,21 @@ def analyze_with_ai(transcript, policy=None, session_id=None):
             "disclaimer_agreed": False
         }
 
-def background_task():
-    while True:
-        eventlet.sleep(1)
-        for session_id in audio_buffers:
-            if len(audio_buffers[session_id]) >= CHUNKS_TO_PROCESS:
-                process_audio_buffer(session_id)
-
-eventlet.spawn(background_task)
-
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-        print(f"Database connected: {db.engine.url}")
-        num_policies = db.session.query(Policy).count()
-        print(f"Number of policies in database: {num_policies}")
-    socketio.run(app, debug=True, host="0.0.0.0", port=5000)
+    logger.info("Initializing database...")
+    try:
+        with app.app_context():
+            db.create_all()
+            num_policies = db.session.query(Policy).count()
+            logger.info(f"Database connected: {db.engine.url}")
+            logger.info(f"Number of policies in database: {num_policies}")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        raise
+
+    logger.info("Starting Flask server...")
+    try:
+        app.run(debug=True, host="0.0.0.0", port=5000)
+    except Exception as e:
+        logger.error(f"Failed to start Flask server: {e}")
+        raise
